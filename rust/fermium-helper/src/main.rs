@@ -22,7 +22,7 @@ use fermium_core::{
 use matrix_sdk::{
     Client, LoopCtrl, Room, RoomMemberships, RoomState,
     authentication::matrix::MatrixSession,
-    config::SyncSettings,
+    config::{RequestConfig, SyncSettings},
     deserialized_responses::TimelineEvent,
     media::{MediaFormat, MediaRequestParameters, MediaRetentionPolicy},
     room::{MessagesOptions, Receipts},
@@ -50,6 +50,15 @@ type EventSender = mpsc::Sender<Event>;
 type SharedSessions = Arc<Mutex<HashMap<String, Session>>>;
 type SharedPendingLogins = Arc<Mutex<HashMap<u64, PendingLogin>>>;
 type SharedRoomMemberContexts = Arc<Mutex<HashMap<String, RoomMemberContext>>>;
+
+/// Default timeout for requests the client makes to the homeserver (login, sync, media),
+/// overridable with `--request-timeout=<seconds>`. Slow homeservers can take well over the
+/// matrix-sdk default of 30s to complete an initial sync.
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
+
+/// Fixed timeout for sending a message, kept short so a hung send fails fast and unlocks the
+/// compose box instead of waiting on the full homeserver request timeout.
+const MESSAGE_SEND_TIMEOUT_SECS: u64 = 30;
 
 struct Session {
     client: Client,
@@ -88,8 +97,23 @@ struct StoredSession {
     session: MatrixSession,
 }
 
+fn request_timeout_from_args() -> Duration {
+    for arg in std::env::args().skip(1) {
+        if let Some(value) = arg.strip_prefix("--request-timeout=") {
+            match value.parse::<u64>() {
+                Ok(seconds) => return Duration::from_secs(seconds),
+                Err(error) => {
+                    eprintln!("fermium-helper: invalid --request-timeout value {value:?}: {error}");
+                }
+            }
+        }
+    }
+    Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let request_timeout = request_timeout_from_args();
     let (events_tx, events_rx) = mpsc::channel(128);
     let writer = tokio::spawn(write_events(events_rx));
     let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
@@ -102,7 +126,7 @@ async fn main() -> Result<()> {
         .await
         .context("helper output closed before ready event")?;
 
-    restore_persisted_sessions(&sessions, &events_tx);
+    restore_persisted_sessions(&sessions, &events_tx, request_timeout);
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
@@ -125,6 +149,7 @@ async fn main() -> Result<()> {
             Arc::clone(&sessions),
             Arc::clone(&pending_logins),
             events_tx.clone(),
+            request_timeout,
         )
         .await;
         if should_quit {
@@ -162,6 +187,7 @@ async fn handle_request(
     sessions: SharedSessions,
     pending_logins: SharedPendingLogins,
     events: EventSender,
+    request_timeout: Duration,
 ) {
     let request_id = request.request_id();
     let result = match request {
@@ -179,6 +205,7 @@ async fn handle_request(
                 homeserver,
                 username,
                 password,
+                request_timeout,
             )
             .await
         }
@@ -250,6 +277,7 @@ async fn login(
     homeserver: String,
     username: String,
     password: String,
+    request_timeout: Duration,
 ) -> Result<()> {
     let store_key = account_store_key(&homeserver, &username);
     if sessions
@@ -265,7 +293,7 @@ async fn login(
     {
         return Err(anyhow!("Matrix account is already logged in"));
     }
-    let client = build_client_with_store(&homeserver, &store_key).await?;
+    let client = build_client_with_store(&homeserver, &store_key, request_timeout).await?;
     client
         .matrix_auth()
         .login_username(&username, &password)
@@ -601,6 +629,9 @@ async fn send_message(
                 body.clone(),
             ),
         )
+        .with_request_config(RequestConfig::new().timeout(Duration::from_secs(
+            MESSAGE_SEND_TIMEOUT_SECS,
+        )))
         .await
         .context("sending Matrix message")?;
 
@@ -847,7 +878,11 @@ async fn load_room_member_context(room: &Room, sync_members: bool) -> RoomMember
     context
 }
 
-async fn build_client_with_store(homeserver: &str, store_key: &str) -> Result<Client> {
+async fn build_client_with_store(
+    homeserver: &str,
+    store_key: &str,
+    request_timeout: Duration,
+) -> Result<Client> {
     let homeserver_url = Url::parse(homeserver).context("homeserver must be a valid URL")?;
     let store_path = account_store_path(store_key)?;
     let parent = store_path
@@ -857,6 +892,7 @@ async fn build_client_with_store(homeserver: &str, store_key: &str) -> Result<Cl
     let client = Client::builder()
         .homeserver_url(homeserver_url)
         .sqlite_store(store_path, None)
+        .request_config(RequestConfig::new().timeout(request_timeout))
         .build()
         .await
         .context("building Matrix client")?;
@@ -1221,7 +1257,11 @@ async fn fermium_set_connection_status(
         .await;
 }
 
-fn restore_persisted_sessions(sessions: &SharedSessions, events: &EventSender) {
+fn restore_persisted_sessions(
+    sessions: &SharedSessions,
+    events: &EventSender,
+    request_timeout: Duration,
+) {
     let stored_sessions = match load_persisted_sessions() {
         Ok(stored_sessions) => stored_sessions,
         Err(error) => {
@@ -1240,7 +1280,8 @@ fn restore_persisted_sessions(sessions: &SharedSessions, events: &EventSender) {
         let events = events.clone();
         tokio::spawn(async move {
             let result = async {
-                let client = build_client_with_store(&homeserver, &store_key).await?;
+                let client =
+                    build_client_with_store(&homeserver, &store_key, request_timeout).await?;
                 client.restore_session(stored.session).await?;
                 activate_session(&sessions, &events, 0, client, homeserver, store_key, false).await
             }

@@ -55,6 +55,20 @@ You can navigate between items with `n` and `p`,
 and fold/unfold sections with `TAB`.
 `RET` on a room opens a room buffer where you can view and compose messages.
 
+## Slow homeservers
+
+The helper waits up to `fermium-request-timeout` seconds (120 by default) for a homeserver
+to respond to login, sync, and media requests. If your homeserver is slow enough that the
+initial sync sometimes fails, raise this value:
+
+``` emacs-lisp
+(setq fermium-request-timeout 180)
+```
+
+Sending a message always uses its own fixed 30-second timeout, regardless of this setting,
+so a stuck send fails quickly and re-enables the compose box instead of blocking on the
+longer homeserver timeout.
+
 ## Themes and face customization
 
 Fermium uses named faces that inherit from Emacs's standard theme-aware faces;

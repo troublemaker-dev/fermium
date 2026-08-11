@@ -38,6 +38,14 @@ When nil, use the development helper under this package's workspace."
   :type 'string
   :group 'fermium)
 
+(defcustom fermium-request-timeout 120
+  "Timeout, in seconds, for the helper's login, sync, and media requests.
+Raise this if your homeserver is slow to complete an initial sync.
+Message sending has its own fixed, shorter timeout and is unaffected
+by this setting."
+  :type 'integer
+  :group 'fermium)
+
 (defconst fermium-room-unknown-user-label "<UNKNOWN USER>"
   "Label used when a message has neither a display name nor a sender ID.")
 
@@ -486,7 +494,8 @@ coloring, or replace it with a custom list of faces."
     (setq fermium--process
           (make-process
            :name "fermium-helper"
-           :command (list (fermium--helper-program))
+           :command (list (fermium--helper-program)
+                           (format "--request-timeout=%d" fermium-request-timeout))
            :connection-type 'pipe
            :coding 'utf-8
            :noquery t

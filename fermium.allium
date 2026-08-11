@@ -14,6 +14,7 @@ external entity MatrixHomeserver {}
 
 config {
     message_send_timeout: Duration = 30.seconds
+    homeserver_request_timeout: Duration = 120.seconds  -- configurable; overridden by fermium-request-timeout
     reconnect_interval: Duration = 1.minute
 }
 
